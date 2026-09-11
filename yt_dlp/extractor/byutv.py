@@ -1,104 +1,165 @@
+import re
+import uuid
+
 from .common import InfoExtractor
 from ..utils import (
+    ExtractorError,
     determine_ext,
-    merge_dicts,
-    parse_duration,
+    int_or_none,
+    parse_age_limit,
+    parse_iso8601,
     url_or_none,
 )
+from ..utils.traversal import traverse_obj
+
+
+def _parse_timespan(value):
+    """Parse a .NET TimeSpan (``[d.]hh:mm:ss[.fffffff]``) into seconds"""
+    mobj = re.fullmatch(
+        r'(?:(?P<days>\d+)\.)?(?P<hours>\d+):(?P<mins>\d{1,2}):(?P<secs>\d{1,2}(?:\.\d+)?)',
+        str(value or '').strip())
+    if not mobj:
+        return None
+    return (
+        int(mobj.group('days') or 0) * 86400
+        + int(mobj.group('hours')) * 3600
+        + int(mobj.group('mins')) * 60
+        + float(mobj.group('secs')))
 
 
 class BYUtvIE(InfoExtractor):
-    _WORKING = False
-    _VALID_URL = r'https?://(?:www\.)?byutv\.org/(?:watch|player)/(?!event/)(?P<id>[0-9a-f-]+)(?:/(?P<display_id>[^/?#&]+))?'
+    _VALID_URL = r'''(?x)
+        https?://(?:www\.)?byutv\.org/
+        (?:(?:watch|player)/(?!event/))?
+        (?P<id>[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12})
+        (?:/(?P<display_id>[^/?#&]+))?'''
     _TESTS = [{
-        'url': 'http://www.byutv.org/watch/6587b9a3-89d2-42a6-a7f7-fd2f81840a7d/studio-c-season-5-episode-5',
+        'url': 'https://www.byutv.org/6587b9a3-89d2-42a6-a7f7-fd2f81840a7d/season-5-episode-5',
         'info_dict': {
-            'id': 'ZvanRocTpW-G5_yZFeltTAMv6jxOU9KH',
-            'display_id': 'studio-c-season-5-episode-5',
+            'id': '6587b9a3-89d2-42a6-a7f7-fd2f81840a7d',
+            'display_id': 'season-5-episode-5',
             'ext': 'mp4',
             'title': 'Season 5 Episode 5',
-            'description': 'md5:1d31dc18ef4f075b28f6a65937d22c65',
-            'thumbnail': r're:^https?://.*',
-            'duration': 1486.486,
+            'description': 'Matt gives his last words, and Hunger Games characters try to decide who Katniss should marry.',
+            'thumbnail': r're:https?://.+',
+            'duration': 1486.592,
+            'series': 'Studio C',
+            'season': 'Season 5',
+            'season_number': 5,
+            'episode': 'Episode 5',
+            'episode_number': 5,
+            'upload_date': '20141103',
+            'timestamp': 1414998000,
+            'age_limit': 0,
         },
-        'params': {
-            'skip_download': True,
-        },
+        'params': {'skip_download': True},
     }, {
-        # dvr
-        'url': 'https://www.byutv.org/player/8f1dab9b-b243-47c8-b525-3e2d021a3451/byu-softball-pacific-vs-byu-41219---game-2',
-        'info_dict': {
-            'id': '8f1dab9b-b243-47c8-b525-3e2d021a3451',
-            'display_id': 'byu-softball-pacific-vs-byu-41219---game-2',
-            'ext': 'mp4',
-            'title': 'Pacific vs. BYU (4/12/19)',
-            'description': 'md5:1ac7b57cb9a78015910a4834790ce1f3',
-            'duration': 11645,
-        },
-        'params': {
-            'skip_download': True,
-        },
-    }, {
-        'url': 'http://www.byutv.org/watch/6587b9a3-89d2-42a6-a7f7-fd2f81840a7d',
+        # legacy /watch/ URL, still redirects on the site
+        'url': 'http://www.byutv.org/watch/6587b9a3-89d2-42a6-a7f7-fd2f81840a7d/studio-c-season-5-episode-5',
         'only_matching': True,
     }, {
-        'url': 'https://www.byutv.org/player/27741493-dc83-40b0-8420-e7ae38a2ae98/byu-football-toledo-vs-byu-93016?listid=4fe0fee5-0d3c-4a29-b725-e4948627f472&listindex=0&q=toledo',
+        'url': 'https://www.byutv.org/player/8f1dab9b-b243-47c8-b525-3e2d021a3451/byu-softball-pacific-vs-byu-41219---game-2',
+        'only_matching': True,
+    }, {
+        'url': 'https://www.byutv.org/c0221346-f76b-4372-9b3d-0ab94f7340f0',
         'only_matching': True,
     }]
 
+    _API_BASE = 'https://api.byub.org'
+    # Public web client key, from the site's Nuxt runtime config
+    _CLIENT = 'byutv-web-dk94tsvophi'
+    _CLIENT_VERSION = '5.69.0'
+
+    def _call_api(self, path, video_id, note, expected_status=None):
+        return self._download_json(
+            f'{self._API_BASE}/{path}', video_id, note=note,
+            expected_status=expected_status, headers={
+                'x-byub-client': self._CLIENT,
+                'x-byub-clientversion': self._CLIENT_VERSION,
+                'x-byub-device': str(uuid.uuid4()),
+                'x-byub-session': str(uuid.uuid4()),
+                'x-byub-location': 'us',
+                'x-byub-isauthenticated': 'false',
+                'x-byub-offset': '0',
+                'accept-language': 'en',
+                'Origin': 'https://www.byutv.org',
+                'Referer': 'https://www.byutv.org/',
+            })
+
     def _real_extract(self, url):
-        mobj = self._match_valid_url(url)
-        video_id = mobj.group('id')
-        display_id = mobj.group('display_id') or video_id
+        video_id, display_id = self._match_valid_url(url).group('id', 'display_id')
 
-        video = self._download_json(
-            'https://api.byutv.org/api3/catalog/getvideosforcontent',
-            display_id, query={
-                'contentid': video_id,
-                'channel': 'byutv',
-                'x-byutv-context': 'web$US',
-            }, headers={
-                'x-byutv-context': 'web$US',
-                'x-byutv-platformkey': 'xsaaw9c7y5',
+        item = self._call_api(
+            f'views/v2/public/content/{video_id}', video_id, 'Downloading content JSON')
+        content = item.get('content') or {}
+
+        media_id = item.get('mediaId')
+        if not media_id:
+            raise ExtractorError('This content has no playable media', expected=True)
+        if traverse_obj(item, ('media', 'requireLogin')):
+            self.raise_login_required('This video requires a BYUtv account')
+
+        media = self._call_api(
+            f'media/v1/public/media/{media_id}', video_id, 'Downloading media JSON',
+            expected_status=(401, 403, 404))
+        if error := media.get('message'):
+            if media.get('type') == 'Unauthorized' or 'login' in error.lower():
+                self.raise_login_required(error)
+            raise ExtractorError(error, expected=True)
+
+        formats, subtitles = [], {}
+        for asset in traverse_obj(media, ('assets', lambda _, v: url_or_none(v['url']))):
+            asset_url = asset['url']
+            asset_type = asset.get('assetType')
+            if asset_type == 'dash1' or determine_ext(asset_url) == 'mpd':
+                # DASH is Widevine-protected (rmt=wv), HLS below is not
+                continue
+            if asset_type == 'hls1' or determine_ext(asset_url) == 'm3u8':
+                fmts, subs = self._extract_m3u8_formats_and_subtitles(
+                    asset_url, video_id, 'mp4', m3u8_id='hls', fatal=False)
+                formats.extend(fmts)
+                self._merge_subtitles(subs, target=subtitles)
+
+        if not formats:
+            self.raise_no_formats(
+                'No DRM-free formats found', video_id=video_id, expected=True)
+
+        parents = traverse_obj(content, ('parents', ...))
+        show = traverse_obj(parents, (lambda _, v: v['sourceType'] == 'show', any))
+        season = traverse_obj(parents, (lambda _, v: v['sourceType'] == 'season', any))
+
+        # The image service only serves sizes matching the image's declared
+        # aspect ratio, so scale each one to a long edge of 1280
+        thumbnails = []
+        for image in traverse_obj(content, ('images', lambda _, v: v['imageId'] and v['baseUrl'])):
+            ratio_w, _, ratio_h = (image.get('aspectRatio') or '16:9').partition(':')
+            ratio_w, ratio_h = int_or_none(ratio_w), int_or_none(ratio_h)
+            if not ratio_w or not ratio_h:
+                continue
+            width = 1280 if ratio_w >= ratio_h else round(1280 * ratio_w / ratio_h)
+            height = 1280 if ratio_h >= ratio_w else round(1280 * ratio_h / ratio_w)
+            thumbnails.append({
+                'id': image.get('type'),
+                'url': f'{image["baseUrl"]}/{image["imageId"]}/{width}x{height}.webp',
+                'width': width,
+                'height': height,
+                'preference': 1 if image.get('type') == 'content' else -1,
             })
 
-        info = {}
-        formats = []
-        subtitles = {}
-        for format_id, ep in video.items():
-            if not isinstance(ep, dict):
-                continue
-            video_url = url_or_none(ep.get('videoUrl'))
-            if not video_url:
-                continue
-            ext = determine_ext(video_url)
-            if ext == 'm3u8':
-                m3u8_fmts, m3u8_subs = self._extract_m3u8_formats_and_subtitles(
-                    video_url, video_id, 'mp4', entry_protocol='m3u8_native',
-                    m3u8_id='hls', fatal=False)
-                formats.extend(m3u8_fmts)
-                subtitles = self._merge_subtitles(subtitles, m3u8_subs)
-            elif ext == 'mpd':
-                mpd_fmts, mpd_subs = self._extract_mpd_formats_and_subtitles(
-                    video_url, video_id, mpd_id='dash', fatal=False)
-                formats.extend(mpd_fmts)
-                subtitles = self._merge_subtitles(subtitles, mpd_subs)
-            else:
-                formats.append({
-                    'url': video_url,
-                    'format_id': format_id,
-                })
-            info = merge_dicts(info, {
-                'title': ep.get('title'),
-                'description': ep.get('description'),
-                'thumbnail': ep.get('imageThumbnail'),
-                'duration': parse_duration(ep.get('length')),
-            })
-
-        return merge_dicts(info, {
+        return {
             'id': video_id,
-            'display_id': display_id,
-            'title': display_id,
+            'display_id': display_id or video_id,
             'formats': formats,
             'subtitles': subtitles,
-        })
+            'thumbnails': thumbnails,
+            'title': content.get('title') or display_id,
+            'description': content.get('longDescription') or content.get('shortDescription'),
+            'duration': _parse_timespan(content.get('length')),
+            'timestamp': parse_iso8601(content.get('airDate')),
+            'series': traverse_obj(show, 'title'),
+            'season': traverse_obj(season, 'title'),
+            'season_number': int_or_none(traverse_obj(season, 'seasonNumber')),
+            'episode_number': int_or_none(content.get('episodeNumber')),
+            'age_limit': parse_age_limit(
+                content.get('rating') or traverse_obj(parents, (..., 'rating', any))),
+        }
